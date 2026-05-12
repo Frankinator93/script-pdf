@@ -32,7 +32,7 @@ SCAN_DIR = r"C:\Users\fto\Downloads\Scans\2022"
  
 # Chemin vers l'exécutable Tesseract (adapter si nécessaire)
 # Exemple Windows : r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_CMD = r"C:\Users\fto\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
  
 # Langue OCR (fra = français, eng = anglais, fra+eng = les deux)
 OCR_LANG = "fra+eng"
