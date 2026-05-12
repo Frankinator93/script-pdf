@@ -1,194 +1,170 @@
-#!/usr/bin/env python3
 """
-rename_pdf_by_demande.py
-------------------------
-Renomme les fichiers PDF d'un dossier selon leur numéro de demande
-au format Dxxxxx_xxxxx (ex: D12345_67890) extrait du contenu du PDF.
+Script de renommage automatique de fichiers PDF
+selon le numéro de demande au format Dxxxxx_xxxxx
 
-Usage:
-    python rename_pdf_by_demande.py <dossier>
-    python rename_pdf_by_demande.py <dossier> --dry-run   # simulation sans renommer
-    python rename_pdf_by_demande.py <dossier> --recursive  # inclure les sous-dossiers
+Dossier cible : C:\\Users\\fto\\Downloads\\Scans\\2022
 """
 
-import argparse
+import os
 import re
-import sys
+import shutil
 from pathlib import Path
 
-# --- Dépendances ---
-# pip install pdfplumber pypdf
 try:
     import pdfplumber
-    HAS_PDFPLUMBER = True
 except ImportError:
-    HAS_PDFPLUMBER = False
+    print("Installation de pdfplumber en cours...")
+    os.system("pip install pdfplumber")
+    import pdfplumber
 
 try:
     from pypdf import PdfReader
-    HAS_PYPDF = True
 except ImportError:
-    HAS_PYPDF = False
-
-if not HAS_PDFPLUMBER and not HAS_PYPDF:
-    print("Erreur : installez au moins une bibliothèque PDF :")
-    print("  pip install pdfplumber pypdf")
-    sys.exit(1)
+    print("Installation de pypdf en cours...")
+    os.system("pip install pypdf")
+    from pypdf import PdfReader
 
 
-# Regex : D suivi de 5 chiffres, underscore, 5 chiffres
-PATTERN = re.compile(r'\bD\d{5}_\d{5}\b')
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+DOSSIER = r"C:\Users\fto\Downloads\Scans\2022"
+
+# Regex : D suivi de 5 chiffres, underscore, 5 chiffres  →  ex: D12345_67890
+PATTERN_DEMANDE = re.compile(r'D(\d{5})_(\d{5})', re.IGNORECASE)
+
+# Si True  → simulation uniquement, aucun fichier n'est renommé
+MODE_SIMULATION = False
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-def extract_text_pdfplumber(pdf_path: Path) -> str:
-    """Extraction de texte via pdfplumber (meilleur pour les PDFs complexes)."""
-    text_parts = []
+def extraire_texte_pdfplumber(chemin_pdf: Path) -> str:
+    """Extraction du texte via pdfplumber (meilleure précision de layout)."""
+    texte = []
     try:
-        with pdfplumber.open(pdf_path) as pdf:
+        with pdfplumber.open(chemin_pdf) as pdf:
             for page in pdf.pages:
                 t = page.extract_text()
                 if t:
-                    text_parts.append(t)
-                # Arrêt dès que le numéro est trouvé (optimisation)
-                if PATTERN.search("\n".join(text_parts)):
-                    break
+                    texte.append(t)
     except Exception as e:
-        raise RuntimeError(f"pdfplumber: {e}")
-    return "\n".join(text_parts)
+        print(f"    [pdfplumber] Erreur sur {chemin_pdf.name} : {e}")
+    return "\n".join(texte)
 
 
-def extract_text_pypdf(pdf_path: Path) -> str:
-    """Extraction de texte via pypdf (fallback)."""
-    text_parts = []
+def extraire_texte_pypdf(chemin_pdf: Path) -> str:
+    """Extraction de secours via pypdf."""
+    texte = []
     try:
-        reader = PdfReader(str(pdf_path))
+        reader = PdfReader(str(chemin_pdf))
         for page in reader.pages:
             t = page.extract_text()
             if t:
-                text_parts.append(t)
-            if PATTERN.search("\n".join(text_parts)):
-                break
+                texte.append(t)
     except Exception as e:
-        raise RuntimeError(f"pypdf: {e}")
-    return "\n".join(text_parts)
+        print(f"    [pypdf] Erreur sur {chemin_pdf.name} : {e}")
+    return "\n".join(texte)
 
 
-def extract_text(pdf_path: Path) -> str:
-    """Essaie pdfplumber en premier, puis pypdf en fallback."""
-    if HAS_PDFPLUMBER:
-        try:
-            return extract_text_pdfplumber(pdf_path)
-        except RuntimeError as e:
-            print(f"  ⚠  pdfplumber a échoué ({e}), tentative avec pypdf…")
-    if HAS_PYPDF:
-        return extract_text_pypdf(pdf_path)
-    return ""
-
-
-def find_demande_number(text: str) -> str | None:
+def trouver_numero_demande(texte: str) -> str | None:
     """Retourne le premier numéro de demande trouvé dans le texte, ou None."""
-    match = PATTERN.search(text)
-    return match.group(0) if match else None
+    match = PATTERN_DEMANDE.search(texte)
+    if match:
+        # Normaliser la casse → toujours majuscule
+        return f"D{match.group(1)}_{match.group(2)}"
+    return None
 
 
-def build_new_name(demande_number: str, suffix: int = 0) -> str:
-    """Construit le nom de fichier cible (avec suffixe si doublon)."""
-    base = f"{demande_number}.pdf"
-    if suffix == 0:
-        return base
-    return f"{demande_number}_{suffix}.pdf"
+def renommer_pdfs(dossier: str, simulation: bool = False) -> None:
+    dossier_path = Path(dossier)
 
-
-def rename_pdfs(folder: Path, dry_run: bool = False, recursive: bool = False):
-    """Parcourt le dossier et renomme les PDFs selon leur numéro de demande."""
-    pattern = "**/*.pdf" if recursive else "*.pdf"
-    pdf_files = sorted(folder.glob(pattern))
-
-    if not pdf_files:
-        print(f"Aucun fichier PDF trouvé dans : {folder}")
+    if not dossier_path.exists():
+        print(f"❌  Le dossier n'existe pas : {dossier}")
         return
 
-    print(f"{'[SIMULATION] ' if dry_run else ''}Traitement de {len(pdf_files)} fichier(s)…\n")
+    pdfs = sorted(dossier_path.glob("*.pdf"))
 
-    stats = {"renamed": 0, "skipped": 0, "not_found": 0, "errors": 0}
-    used_names: dict[str, Path] = {}  # garde une trace des noms déjà attribués
+    if not pdfs:
+        print(f"⚠️   Aucun fichier PDF trouvé dans : {dossier}")
+        return
 
-    for pdf_path in pdf_files:
-        print(f"📄 {pdf_path.name}")
-        try:
-            text = extract_text(pdf_path)
-        except Exception as e:
-            print(f"  ✗ Erreur lors de la lecture : {e}\n")
-            stats["errors"] += 1
+    print(f"\n{'=' * 60}")
+    print(f"  Dossier  : {dossier}")
+    print(f"  PDFs     : {len(pdfs)} fichier(s)")
+    print(f"  Mode     : {'SIMULATION' if simulation else 'RENOMMAGE RÉEL'}")
+    print(f"{'=' * 60}\n")
+
+    ok, deja_nomme, non_trouve, erreur = 0, 0, 0, 0
+
+    for pdf_path in pdfs:
+        print(f"📄  {pdf_path.name}")
+
+        # 1. Le fichier est-il déjà nommé correctement ?
+        if PATTERN_DEMANDE.match(pdf_path.stem):
+            print(f"    ✅  Déjà au bon format — ignoré.\n")
+            deja_nomme += 1
             continue
 
-        demande_number = find_demande_number(text)
+        # 2. Extraction du texte (pdfplumber en premier, pypdf en secours)
+        texte = extraire_texte_pdfplumber(pdf_path)
+        if not texte.strip():
+            print("    ⚠️   pdfplumber : texte vide, tentative avec pypdf…")
+            texte = extraire_texte_pypdf(pdf_path)
 
-        if not demande_number:
-            print(f"  ✗ Numéro de demande introuvable (format Dxxxxx_xxxxx)\n")
-            stats["not_found"] += 1
+        if not texte.strip():
+            print("    ❌  Impossible d'extraire le texte (PDF scanné ?).\n")
+            erreur += 1
             continue
 
-        print(f"  ✔ Numéro trouvé : {demande_number}")
+        # 3. Recherche du numéro de demande
+        numero = trouver_numero_demande(texte)
 
-        # Gestion des doublons
-        suffix = 0
-        new_name = build_new_name(demande_number, suffix)
-        target_path = pdf_path.parent / new_name
-        while target_path in used_names.values() or (target_path.exists() and target_path != pdf_path):
-            suffix += 1
-            new_name = build_new_name(demande_number, suffix)
-            target_path = pdf_path.parent / new_name
-
-        if pdf_path.name == new_name:
-            print(f"  — Fichier déjà nommé correctement, ignoré.\n")
-            stats["skipped"] += 1
+        if not numero:
+            print(f"    ❌  Numéro de demande introuvable (format D#####_#####).\n")
+            non_trouve += 1
             continue
 
-        print(f"  → {'Serait renommé' if dry_run else 'Renommé'} : {new_name}")
-        if not dry_run:
-            pdf_path.rename(target_path)
-        used_names[demande_number] = target_path
-        stats["renamed"] += 1
-        print()
+        # 4. Construction du nouveau nom
+        nouveau_nom = f"{numero}.pdf"
+        nouveau_chemin = pdf_path.parent / nouveau_nom
 
-    print("─" * 50)
-    print(f"Résumé :")
-    print(f"  ✔ Renommés     : {stats['renamed']}")
-    print(f"  — Ignorés      : {stats['skipped']}")
-    print(f"  ✗ Sans numéro  : {stats['not_found']}")
-    print(f"  ✗ Erreurs      : {stats['errors']}")
-    if dry_run:
-        print("\n⚠  Mode simulation — aucun fichier n'a été modifié.")
+        # 5. Éviter les collisions de noms
+        if nouveau_chemin.exists() and nouveau_chemin != pdf_path:
+            compteur = 1
+            while nouveau_chemin.exists():
+                nouveau_nom = f"{numero}_{compteur}.pdf"
+                nouveau_chemin = pdf_path.parent / nouveau_nom
+                compteur += 1
+            print(f"    ⚠️   Collision détectée → nouveau nom : {nouveau_nom}")
+
+        print(f"    🔄  {pdf_path.name}  →  {nouveau_nom}")
+
+        if not simulation:
+            try:
+                pdf_path.rename(nouveau_chemin)
+                print(f"    ✅  Renommé avec succès.\n")
+                ok += 1
+            except Exception as e:
+                print(f"    ❌  Échec du renommage : {e}\n")
+                erreur += 1
+        else:
+            print(f"    [SIMULATION — aucune modification]\n")
+            ok += 1
+
+    # Récapitulatif
+    print(f"{'=' * 60}")
+    print(f"  ✅  Renommés     : {ok}")
+    print(f"  ⏭️   Déjà OK      : {deja_nomme}")
+    print(f"  ⚠️   N° introuvable: {non_trouve}")
+    print(f"  ❌  Erreurs       : {erreur}")
+    print(f"{'=' * 60}\n")
+
+    if simulation:
+        print("ℹ️   Mode simulation activé : aucun fichier n'a été modifié.")
+        print("    Passez MODE_SIMULATION = False pour appliquer les renommages.\n")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Renomme les PDFs selon leur numéro de demande (format Dxxxxx_xxxxx)."
-    )
-    parser.add_argument(
-        "dossier",
-        type=Path,
-        help="Dossier contenant les fichiers PDF à traiter"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Simule les renommages sans modifier les fichiers"
-    )
-    parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Traite également les sous-dossiers"
-    )
-    args = parser.parse_args()
-
-    if not args.dossier.is_dir():
-        print(f"Erreur : '{args.dossier}' n'est pas un dossier valide.")
-        sys.exit(1)
-
-    rename_pdfs(args.dossier, dry_run=args.dry_run, recursive=args.recursive)
-
+# ─── Point d'entrée ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    renommer_pdfs(DOSSIER, simulation=MODE_SIMULATION)
