@@ -1,229 +1,352 @@
-#!/usr/bin/env python3
 """
-Script de renommage automatique de PDFs scannés.
-Détecte le numéro de ticket dans le document et renomme en D12345_67890.
+rename_pdf_ocr.py
+─────────────────
+Renomme les PDFs scannes en lisant le numero de serie situe
+PHYSIQUEMENT EN DESSOUS du libelle "N° BON DE COMMANDE".
  
-Dépendances :
-    pip install pypdf pdfplumber pytesseract pillow pdf2image
-    Tesseract OCR doit être installé :
-        - Windows : https://github.com/UB-Mannheim/tesseract/wiki
-        - Linux   : sudo apt install tesseract-ocr tesseract-ocr-fra
-        - macOS   : brew install tesseract tesseract-lang
+Methode :
+  1. OCR avec donnees de position (pytesseract image_to_data).
+  2. On localise le mot "COMMANDE" dans la page.
+  3. On definit une zone de recherche = rectangle situe
+       - horizontalement : autour du centre du libelle (+/- marge)
+       - verticalement   : SOUS le libelle (de bas_libelle a bas_libelle + hauteur_ligne*3)
+  4. On collecte tous les mots OCR qui tombent dans cette zone.
+  5. On reconstitue le token (ex: C90005363/D221114_000139).
+  6. Si le token contient Dxxxxxx_xxxxxx, on extrait ce sous-bloc.
+     Sinon on utilise le token complet (/ remplace par _).
+ 
+Dependances :
+    pip install pymupdf pytesseract pillow
+    + Tesseract OCR : https://github.com/UB-Mannheim/tesseract/wiki
+ 
+Utilisation :
+    python rename_pdf_ocr.py
 """
  
 import os
 import re
-import shutil
 import sys
-import logging
-from pathlib import Path
+import fitz
+import pytesseract
+from PIL import Image
+import io
+import pandas as pd
  
-# ── Librairies PDF ────────────────────────────────────────────────────────────
-try:
-    import pdfplumber
-except ImportError:
-    pdfplumber = None
+# ──────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ──────────────────────────────────────────────────────────────
  
-try:
-    import pytesseract
-    from pdf2image import convert_from_path
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
+SCAN_DIR      = r"C:\Users\fto\Downloads\Scans\2022"
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+OCR_LANG      = "fra+eng"
+RENDER_DPI    = 300
+MAX_PAGES     = 2
+DRY_RUN       = False
  
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# PATTERNS
+# ──────────────────────────────────────────────────────────────
  
-# Dossier contenant les PDFs à traiter (modifiez selon votre besoin)
-DOSSIER_SOURCE = r"C:\Scans"           # ou "/home/user/scans" sous Linux/macOS
+# Sous-pattern Dxxxxxx_xxxxxx (prioritaire si present dans le token)
+D_PATTERN = re.compile(r'D\d{6}_\d{6}', re.IGNORECASE)
  
-# Dossier de destination pour les fichiers renommés
-DOSSIER_DESTINATION = r"C:\Tickets_Renommes"
+# Token numero de serie valide : lettre + alphanum + au moins un separateur /
+# Ex : C90005363/D221114_000139  C506048577/123/BU00243
+TOKEN_PATTERN = re.compile(r'^[A-Z][A-Z0-9]{2,}(?:[/\-][A-Z0-9]+)+$', re.IGNORECASE)
  
-# Déplacer le fichier (True) ou le copier (False)
-DEPLACER_FICHIER = True
+# Variantes OCR du mot "COMMANDE" (le dernier mot du libelle)
+COMMANDE_RE = re.compile(r'C[O0]MMANDE', re.IGNORECASE)
  
-# Langue OCR : "fra" (français), "eng" (anglais), "fra+eng" (les deux)
-LANGUE_OCR = "fra+eng"
- 
-# Si Tesseract n'est pas dans le PATH (Windows surtout), indiquez le chemin :
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
- 
-# Patterns de numéros de ticket à détecter (ajoutez vos propres formats ici)
-# Format cible final : D12345_67890
-PATTERNS_TICKET = [
-    # Format exact  D12345_67890  (avec ou sans espaces autour du _)
-    r'\bD\s*(\d{3,6})\s*[_\-/]\s*(\d{3,6})\b',
- 
-    # Ticket n° 12345 / 67890  ou  Ticket: 12345-67890
-    r'(?:ticket|n°|no\.?|num\.?|ref\.?|dossier)[^\d]*(\d{3,6})[^\d]+(\d{3,6})',
- 
-    # Référence 12345_67890  ou  Ref: 12345/67890
-    r'(?:réf(?:érence)?|reference|ref)[^\d]*(\d{3,6})[^\d]+(\d{3,6})',
- 
-    # Deux blocs de chiffres séparés par _ - /  (fallback plus large)
-    r'(\d{4,6})\s*[_\-/]\s*(\d{4,6})',
-]
- 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger(__name__)
+# Caracteres interdits Windows
+FORBIDDEN = re.compile(r'[\\/:*?"<>|\s]')
  
  
-# ── Fonctions ──────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# UTILITAIRES
+# ──────────────────────────────────────────────────────────────
  
-def extraire_texte_pdf(chemin_pdf: Path) -> str:
-    """Tente d'extraire le texte d'un PDF, avec fallback OCR si le texte est vide."""
-    texte = ""
+def configure_tesseract():
+    if os.path.isfile(TESSERACT_CMD):
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    else:
+        print(f"[WARN] Tesseract introuvable : {TESSERACT_CMD}")
+        print("       https://github.com/UB-Mannheim/tesseract/wiki\n")
  
-    # 1) Extraction directe avec pdfplumber (PDFs textuels)
-    if pdfplumber:
+ 
+def sanitize(name: str) -> str:
+    clean = FORBIDDEN.sub('_', name)
+    clean = re.sub(r'_+', '_', clean)
+    return clean.strip('_')
+ 
+ 
+def page_to_image(page, dpi=RENDER_DPI, clip=None) -> Image.Image:
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip)
+    return Image.open(io.BytesIO(pix.tobytes("png")))
+ 
+ 
+# ──────────────────────────────────────────────────────────────
+# EXTRACTION PAR POSITION
+# ──────────────────────────────────────────────────────────────
+ 
+def extraire_numero_depuis_image(image: Image.Image) -> str | None:
+    """
+    Utilise pytesseract.image_to_data pour obtenir chaque mot avec
+    ses coordonnees (left, top, width, height).
+ 
+    Etapes :
+      1. Trouver le mot "COMMANDE" (dernier mot du libelle).
+      2. Definir une boite de recherche SOUS ce mot :
+            x : de (centre_commande - largeur_page*0.30)
+                a (centre_commande + largeur_page*0.30)
+            y : de (bas_commande + 2px)
+                a (bas_commande + hauteur_commande * 4)
+      3. Collecter les mots OCR dans cette boite, les concatener.
+      4. Appliquer la regle de nommage.
+    """
+    data = pytesseract.image_to_data(
+        image,
+        lang=OCR_LANG,
+        config="--psm 3 --oem 3",
+        output_type=pytesseract.Output.DICT
+    )
+ 
+    img_w, img_h = image.size
+    n = len(data['text'])
+ 
+    # ── 1. Localiser "COMMANDE" ──────────────────────────────────────────
+    commande_boxes = []
+    for i in range(n):
+        word = str(data['text'][i]).strip()
+        conf = int(data['conf'][i]) if str(data['conf'][i]).lstrip('-').isdigit() else -1
+        if conf < 20:
+            continue
+        if COMMANDE_RE.fullmatch(word):
+            left   = data['left'][i]
+            top    = data['top'][i]
+            width  = data['width'][i]
+            height = data['height'][i]
+            commande_boxes.append({
+                'left': left, 'top': top,
+                'width': width, 'height': height,
+                'cx': left + width // 2,
+                'bottom': top + height
+            })
+ 
+    if not commande_boxes:
+        return None
+ 
+    # On prend le "COMMANDE" le plus bas de la page (le tableau est en bas)
+    label = max(commande_boxes, key=lambda b: b['bottom'])
+ 
+    # ── 2. Definir la zone de recherche sous le libelle ──────────────────
+    marge_h  = int(img_w * 0.28)          # +/- 28 % largeur autour du centre
+    x_min    = max(0,     label['cx'] - marge_h)
+    x_max    = min(img_w, label['cx'] + marge_h)
+    y_min    = label['bottom'] + 2
+    y_max    = label['bottom'] + label['height'] * 5   # ~2 lignes sous le libelle
+ 
+    # ── 3. Collecter les mots dans la zone ───────────────────────────────
+    mots_zone = []
+    for i in range(n):
+        word = str(data['text'][i]).strip()
+        if not word:
+            continue
+        conf = int(data['conf'][i]) if str(data['conf'][i]).lstrip('-').isdigit() else -1
+        if conf < 20:
+            continue
+        left   = data['left'][i]
+        top    = data['top'][i]
+        width  = data['width'][i]
+        height = data['height'][i]
+        cx     = left + width  // 2
+        cy     = top  + height // 2
+ 
+        if x_min <= cx <= x_max and y_min <= cy <= y_max:
+            mots_zone.append((left, word))   # (position_x, mot)
+ 
+    if not mots_zone:
+        return None
+ 
+    # Trier par position horizontale et concatener
+    mots_zone.sort(key=lambda x: x[0])
+    token = ''.join(m for _, m in mots_zone).upper()
+ 
+    # Nettoyer les artefacts OCR courants : l espace entre chiffres/lettres
+    token = re.sub(r'\s+', '', token)
+ 
+    # ── 4. Valider et retourner le numero ─────────────────────────────────
+    if not TOKEN_PATTERN.match(token):
+        return None
+ 
+    # Priorite : si le token contient Dxxxxxx_xxxxxx, on l'extrait
+    d_match = D_PATTERN.search(token)
+    if d_match:
+        return d_match.group(0).upper()
+ 
+    # Sinon : token complet avec / remplace par _
+    return sanitize(token)
+ 
+ 
+def extraire_numero_pdf(pdf_path: str) -> str | None:
+    """
+    Parcourt les premieres pages du PDF.
+    Pour chaque page, essaie :
+      1. Texte natif PyMuPDF  (PDF non scanne)
+      2. OCR positionnel page entiere
+      3. OCR positionnel zone basse (50-95 % hauteur) — scan de mauvaise qualite
+    """
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        print(f"  [ERREUR] {e}")
+        return None
+ 
+    for i in range(min(MAX_PAGES, len(doc))):
+        page = doc[i]
+ 
+        # 1) Texte natif : reconstruction ligne par ligne ─────────────────
+        #    On cherche "COMMANDE" puis on lit la ligne suivante
+        texte = page.get_text("text")
+        numero = _extraire_depuis_texte_natif(texte)
+        if numero:
+            doc.close()
+            return numero
+ 
+        # 2) OCR positionnel page entiere ─────────────────────────────────
         try:
-            with pdfplumber.open(chemin_pdf) as pdf:
-                for page in pdf.pages:
-                    t = page.extract_text()
-                    if t:
-                        texte += t + "\n"
+            img = page_to_image(page)
+            numero = extraire_numero_depuis_image(img)
+            if numero:
+                doc.close()
+                return numero
         except Exception as e:
-            log.warning(f"pdfplumber échoué sur {chemin_pdf.name} : {e}")
+            print(f"  [WARN] OCR page entiere p.{i+1} : {e}")
  
-    # 2) Si pas de texte → OCR (PDFs scannés)
-    if not texte.strip():
-        if OCR_AVAILABLE:
-            log.info(f"  → Texte vide, lancement OCR sur {chemin_pdf.name}…")
-            try:
-                images = convert_from_path(str(chemin_pdf), dpi=300)
-                for img in images:
-                    texte += pytesseract.image_to_string(img, lang=LANGUE_OCR) + "\n"
-            except Exception as e:
-                log.error(f"OCR échoué sur {chemin_pdf.name} : {e}")
-        else:
-            log.warning(
-                "OCR non disponible (pytesseract / pdf2image non installés). "
-                "Le PDF scanné ne pourra pas être lu."
-            )
+        # 3) OCR positionnel zone basse (50-95 %) ─────────────────────────
+        try:
+            r = page.rect
+            zone = fitz.Rect(r.x0, r.y0 + r.height * 0.50,
+                             r.x1, r.y0 + r.height * 0.95)
+            img_bas = page_to_image(page, clip=zone)
+            numero = extraire_numero_depuis_image(img_bas)
+            if numero:
+                doc.close()
+                return numero
+        except Exception as e:
+            print(f"  [WARN] OCR zone basse p.{i+1} : {e}")
  
-    return texte
- 
- 
-def detecter_numero_ticket(texte: str) -> tuple[str, str] | None:
-    """
-    Cherche un numéro de ticket dans le texte.
-    Retourne un tuple (partie1, partie2) ou None si aucun trouvé.
-    """
-    texte_norm = texte.replace("\n", " ").replace("\r", " ")
- 
-    for pattern in PATTERNS_TICKET:
-        match = re.search(pattern, texte_norm, re.IGNORECASE)
-        if match:
-            p1, p2 = match.group(1), match.group(2)
-            log.info(f"  → Ticket détecté : D{p1}_{p2}  (pattern : {pattern[:40]}…)")
-            return p1, p2
- 
+    doc.close()
     return None
  
  
-def construire_nom_fichier(partie1: str, partie2: str, suffixe: int = 0) -> str:
-    """Construit le nom de fichier au format D12345_67890.pdf"""
-    base = f"D{partie1}_{partie2}"
-    if suffixe:
-        base = f"{base}_{suffixe}"
-    return base + ".pdf"
- 
- 
-def renommer_pdf(chemin_pdf: Path, dossier_dest: Path) -> bool:
+def _extraire_depuis_texte_natif(texte: str) -> str | None:
     """
-    Traite un fichier PDF : extraction → détection → renommage/déplacement.
-    Retourne True si l'opération a réussi.
+    Pour les PDFs non scannes : recherche la ligne contenant
+    'BON DE COMMANDE' puis lit le token sur la ligne suivante.
     """
-    log.info(f"Traitement : {chemin_pdf.name}")
+    lignes = texte.splitlines()
+    for idx, ligne in enumerate(lignes):
+        if re.search(r'B[O0]N\s+DE\s+C[O0]MMANDE', ligne, re.IGNORECASE):
+            # Chercher le token sur les 3 lignes suivantes
+            for j in range(1, 4):
+                if idx + j >= len(lignes):
+                    break
+                candidate = lignes[idx + j].strip()
+                if TOKEN_PATTERN.match(candidate):
+                    d_match = D_PATTERN.search(candidate.upper())
+                    if d_match:
+                        return d_match.group(0).upper()
+                    return sanitize(candidate.upper())
+    return None
  
-    texte = extraire_texte_pdf(chemin_pdf)
  
-    if not texte.strip():
-        log.warning(f"  ✗ Aucun texte extrait — fichier ignoré : {chemin_pdf.name}")
-        return False
+# ──────────────────────────────────────────────────────────────
+# RENOMMAGE
+# ──────────────────────────────────────────────────────────────
  
-    resultat = detecter_numero_ticket(texte)
-    if not resultat:
-        log.warning(f"  ✗ Numéro de ticket introuvable dans : {chemin_pdf.name}")
-        log.debug(f"    Extrait du texte :\n{texte[:500]}")
-        return False
- 
-    p1, p2 = resultat
-    nom_dest = construire_nom_fichier(p1, p2)
-    chemin_dest = dossier_dest / nom_dest
- 
-    # Gestion des doublons
-    compteur = 1
-    while chemin_dest.exists():
-        nom_dest = construire_nom_fichier(p1, p2, compteur)
-        chemin_dest = dossier_dest / nom_dest
-        compteur += 1
- 
+def renommer(src: str, dst: str) -> bool:
+    base, ext = os.path.splitext(dst)
+    target, n = dst, 1
+    while os.path.exists(target):
+        target = f"{base}_{n}{ext}"
+        n += 1
     try:
-        if DEPLACER_FICHIER:
-            shutil.move(str(chemin_pdf), str(chemin_dest))
-            log.info(f"  ✔ Déplacé   → {chemin_dest}")
-        else:
-            shutil.copy2(str(chemin_pdf), str(chemin_dest))
-            log.info(f"  ✔ Copié     → {chemin_dest}")
+        os.rename(src, target)
+        if target != dst:
+            print(f"  [INFO] Conflit -> renomme en {os.path.basename(target)}")
         return True
     except Exception as e:
-        log.error(f"  ✗ Impossible de renommer/déplacer {chemin_pdf.name} : {e}")
+        print(f"  [ERREUR] {e}")
         return False
  
  
-def traiter_dossier(dossier_source: Path, dossier_dest: Path):
-    """Parcourt le dossier source et traite tous les PDFs trouvés."""
-    if not dossier_source.exists():
-        log.error(f"Dossier source introuvable : {dossier_source}")
+# ──────────────────────────────────────────────────────────────
+# TRAITEMENT DU DOSSIER
+# ──────────────────────────────────────────────────────────────
+ 
+def traiter_dossier(repertoire: str):
+    if not os.path.isdir(repertoire):
+        print(f"[ERREUR] Dossier introuvable : {repertoire}")
         sys.exit(1)
  
-    dossier_dest.mkdir(parents=True, exist_ok=True)
- 
-    pdfs = sorted(dossier_source.glob("*.pdf")) + sorted(dossier_source.glob("*.PDF"))
+    pdfs = sorted(f for f in os.listdir(repertoire) if f.lower().endswith(".pdf"))
     if not pdfs:
-        log.warning(f"Aucun PDF trouvé dans : {dossier_source}")
+        print(f"Aucun PDF trouve dans : {repertoire}")
         return
  
-    log.info(f"{len(pdfs)} fichier(s) PDF trouvé(s) dans {dossier_source}\n")
+    print("=" * 65)
+    print(f"  Dossier : {repertoire}")
+    print(f"  PDFs    : {len(pdfs)}")
+    print(f"  DPI     : {RENDER_DPI}")
+    print(f"  Mode    : {'SIMULATION' if DRY_RUN else 'RENOMMAGE REEL'}")
+    print("=" * 65 + "\n")
  
-    succes, echecs = 0, 0
-    echecs_liste = []
+    ok = skip = echec = 0
  
-    for pdf in pdfs:
-        ok = renommer_pdf(pdf, dossier_dest)
-        if ok:
-            succes += 1
+    for nom in pdfs:
+        src = os.path.join(repertoire, nom)
+        print(f"[->] {nom}")
+ 
+        numero = extraire_numero_pdf(src)
+ 
+        if not numero:
+            print("  [?] Numero introuvable — ignore.\n")
+            echec += 1
+            continue
+ 
+        nouveau = f"{numero}.pdf"
+        dst     = os.path.join(repertoire, nouveau)
+ 
+        if nom == nouveau:
+            print(f"  [OK] Deja correct ({nouveau}) — ignore.\n")
+            skip += 1
+            continue
+ 
+        print(f"  [#] {numero}")
+        print(f"      {nom}  -->  {nouveau}")
+ 
+        if DRY_RUN:
+            print("  [SIM]\n")
+            ok += 1
         else:
-            echecs += 1
-            echecs_liste.append(pdf.name)
-        print()  # ligne vide entre chaque fichier
+            if renommer(src, dst):
+                print("  [OK]\n")
+                ok += 1
+            else:
+                echec += 1
  
-    # Récapitulatif
-    log.info("=" * 60)
-    log.info(f"RÉSUMÉ : {succes} renommé(s) avec succès, {echecs} échec(s).")
-    if echecs_liste:
-        log.warning("Fichiers non traités :")
-        for f in echecs_liste:
-            log.warning(f"  - {f}")
-    log.info("=" * 60)
+    print("=" * 65)
+    print(f"  Renommes      : {ok}")
+    print(f"  Deja corrects : {skip}")
+    print(f"  Echecs        : {echec}")
+    print("=" * 65)
  
  
-# ── Point d'entrée ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# ENTREE
+# ──────────────────────────────────────────────────────────────
  
 if __name__ == "__main__":
-    # Possibilité de passer les dossiers en argument :
-    # python renommer_pdf_ticket.py "C:\Scans" "C:\Destination"
-    if len(sys.argv) >= 3:
-        source = Path(sys.argv[1])
-        dest   = Path(sys.argv[2])
-    else:
-        source = Path(DOSSIER_SOURCE)
-        dest   = Path(DOSSIER_DESTINATION)
- 
-    traiter_dossier(source, dest)
+    configure_tesseract()
+    traiter_dossier(SCAN_DIR)
