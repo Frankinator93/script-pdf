@@ -37,7 +37,7 @@ import pandas as pd
 # ──────────────────────────────────────────────────────────────
  
 SCAN_DIR      = r"C:\Users\fto\Downloads\Scans\2022"
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_CMD = r"C:\Users\fto\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 OCR_LANG      = "fra+eng"
 RENDER_DPI    = 300
 MAX_PAGES     = 2
