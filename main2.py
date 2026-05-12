@@ -47,16 +47,31 @@ MAX_PAGES = 3
 DRY_RUN = False
  
 # ──────────────────────────────────────────────
-# PATTERN du numéro de demande
+# PATTERNS
 # ──────────────────────────────────────────────
-# Le champ "N° BON DE COMMANDE" contient par exemple : C90005363/D221114_000139
-# On extrait uniquement la partie  D + 6 chiffres + _ + 6 chiffres
-# Le séparateur avant le D peut être / \ | espace ou début de chaîne.
-DEMANDE_PATTERN = re.compile(r'(?<![A-Z0-9])(D\d{6}_\d{6})(?!\d)', re.IGNORECASE)
+ 
+# PRIORITE 1 — format Dxxxxxx_xxxxxx  (ex: D221114_000139)
+DEMANDE_PATTERN = re.compile(
+    r'(?<![A-Z0-9])(D\d{6}_\d{6})(?!\d)',
+    re.IGNORECASE
+)
+ 
+# PRIORITE 2 (fallback) — numero complet qui suit le libelle "N° BON DE COMMANDE"
+# Gere les variantes OCR du libelle : "N° BON", "No BON", "N BON", "N0 BON", etc.
+# Capture ensuite le numero sur la meme ligne ou la suivante.
+# Ex: "C506048577/123/BU00243"  ou  "C90005363/D221114_000139"
+LABEL_PATTERN = re.compile(
+    r'N\s*[o\u00b0O0]?\s*(?:BON\s+DE\s+COMMANDE|B[O0]N\s+DE\s+C[O0]MMANDE)'
+    r'[^\n]{0,40}\n?\s*([A-Z0-9][A-Z0-9/\-_.]{3,60})',
+    re.IGNORECASE
+)
+ 
+# Caracteres interdits dans un nom de fichier Windows
+FORBIDDEN_CHARS = re.compile(r'[\\/:*?"<>|\s]')
  
  
 # ──────────────────────────────────────────────
-# FONCTIONS
+# FONCTIONS UTILITAIRES
 # ──────────────────────────────────────────────
  
 def configure_tesseract():
@@ -64,15 +79,25 @@ def configure_tesseract():
     if os.path.isfile(TESSERACT_CMD):
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
     else:
-        print(f"[AVERTISSEMENT] Tesseract introuvable à : {TESSERACT_CMD}")
-        print("  → Assurez-vous que Tesseract est installé et que TESSERACT_CMD est correct.")
-        print("  → Téléchargement : https://github.com/UB-Mannheim/tesseract/wiki\n")
+        print(f"[AVERTISSEMENT] Tesseract introuvable a : {TESSERACT_CMD}")
+        print("  --> Assurez-vous que Tesseract est installe et que TESSERACT_CMD est correct.")
+        print("  --> Telechargement : https://github.com/UB-Mannheim/tesseract/wiki\n")
+ 
+ 
+def sanitize_filename(name: str) -> str:
+    """
+    Remplace les caracteres interdits dans un nom de fichier Windows par '_'.
+    Compresse les '_' consecutifs et supprime ceux en debut/fin.
+    """
+    clean = FORBIDDEN_CHARS.sub('_', name)
+    clean = re.sub(r'_+', '_', clean)
+    return clean.strip('_')
  
  
 def pdf_page_to_image(page, dpi: int = RENDER_DPI, clip_rect=None) -> Image.Image:
     """
     Convertit une page PDF (ou une zone clip_rect) en image PIL via PyMuPDF.
-    clip_rect : fitz.Rect exprimé en points PDF (avant zoom).
+    clip_rect : fitz.Rect exprime en points PDF (avant zoom).
     """
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     if clip_rect:
@@ -85,31 +110,62 @@ def pdf_page_to_image(page, dpi: int = RENDER_DPI, clip_rect=None) -> Image.Imag
 def ocr_image(image: Image.Image, psm: int = 3) -> str:
     """
     Applique l'OCR Tesseract sur une image PIL et retourne le texte.
-    psm=3  → page complète (défaut)
-    psm=6  → bloc de texte uniforme (bon pour une zone isolée)
+    psm=3 : page complete (detection automatique)
+    psm=6 : bloc de texte uniforme (zone isolee)
     """
     config = f"--psm {psm} --oem 3"
     return pytesseract.image_to_string(image, lang=OCR_LANG, config=config)
  
  
-def search_in_text(text: str) -> str | None:
-    """Cherche le pattern dans un texte et retourne la valeur normalisée."""
-    match = DEMANDE_PATTERN.search(text)
-    return match.group(1).upper() if match else None
+# ──────────────────────────────────────────────
+# LOGIQUE DE RECHERCHE AVEC PRIORITE
+# ──────────────────────────────────────────────
  
- 
-def extract_demande_number(pdf_path: str) -> str | None:
+def find_priority_number(text: str):
     """
-    Ouvre le PDF, parcourt les premières pages et retourne le premier
-    numéro de demande trouvé (format Dxxxxxx_xxxxxx).
+    Cherche en PRIORITE le format Dxxxxxx_xxxxxx dans le texte.
+    Retourne (numero, 'priority') ou None.
+    """
+    match = DEMANDE_PATTERN.search(text)
+    if match:
+        return (match.group(1).upper(), 'priority')
+    return None
  
-    Stratégie par page :
-      1. Texte natif (si le PDF n'est pas un scan pur).
-      2. OCR page entière à RENDER_DPI.
-      3. OCR ciblé sur la moitié inférieure de la page
-         (zone où se trouve le tableau "N° BON DE COMMANDE").
  
-    Retourne None si aucun numéro n'est trouvé sur toutes les pages.
+def find_fallback_number(text: str):
+    """
+    Cherche le numero complet sous "N° BON DE COMMANDE" (mode FALLBACK).
+    Retourne (numero_sanitize, 'fallback') ou None.
+    """
+    match = LABEL_PATTERN.search(text)
+    if match:
+        raw = match.group(1).strip()
+        if len(raw) < 4:
+            return None
+        return (sanitize_filename(raw.upper()), 'fallback')
+    return None
+ 
+ 
+def search_in_text(text: str):
+    """
+    Applique la recherche prioritaire puis fallback sur un texte.
+    Retourne (numero, mode) ou None.
+    """
+    result = find_priority_number(text)
+    if result:
+        return result
+    return find_fallback_number(text)
+ 
+ 
+def extract_demande_number(pdf_path: str):
+    """
+    Ouvre le PDF, parcourt les premieres pages et retourne :
+      (numero, mode)  avec mode = 'priority' | 'fallback'
+    ou None si aucun numero n'est trouve.
+ 
+    A chaque passe OCR, un resultat 'priority' est retourne immediatement.
+    Un resultat 'fallback' est conserve et retourne seulement si aucun
+    'priority' n'est trouve sur l'ensemble des pages analysees.
     """
     try:
         doc = fitz.open(pdf_path)
@@ -118,55 +174,67 @@ def extract_demande_number(pdf_path: str) -> str | None:
         return None
  
     pages_to_check = min(MAX_PAGES, len(doc))
+    best_fallback = None   # meilleur fallback toutes passes confondues
  
     for page_num in range(pages_to_check):
         page = doc[page_num]
  
-        # ── 1) Texte natif ────────────────────────────────────────────────
+        # ── Passe 1 : texte natif ─────────────────────────────────────────
         native_text = page.get_text()
         result = search_in_text(native_text)
         if result:
-            doc.close()
-            return result
+            if result[1] == 'priority':
+                doc.close()
+                return result
+            if best_fallback is None:
+                best_fallback = result
  
-        # ── 2) OCR page entière ───────────────────────────────────────────
+        # ── Passe 2 : OCR page entiere ────────────────────────────────────
         try:
             img_full = pdf_page_to_image(page)
             result = search_in_text(ocr_image(img_full, psm=3))
             if result:
-                doc.close()
-                return result
+                if result[1] == 'priority':
+                    doc.close()
+                    return result
+                if best_fallback is None:
+                    best_fallback = result
         except Exception as e:
-            print(f"  [AVERTISSEMENT] OCR page entière échoué (page {page_num+1}) : {e}")
+            print(f"  [AVERTISSEMENT] OCR page entiere echoue (page {page_num+1}) : {e}")
  
-        # ── 3) OCR ciblé — moitié basse de la page ────────────────────────
-        # Le champ "N° BON DE COMMANDE" est typiquement dans la bande
-        # comprise entre 55 % et 85 % de la hauteur de la page.
+        # ── Passe 3 : OCR zone ciblee (bande 50-90 % hauteur) ────────────
         try:
-            rect = page.rect                                # dimensions en pt
+            rect = page.rect
             strip = fitz.Rect(
                 rect.x0,
-                rect.y0 + rect.height * 0.50,   # début à 50 % de la hauteur
+                rect.y0 + rect.height * 0.50,   # debut a 50 % de la hauteur
                 rect.x1,
-                rect.y0 + rect.height * 0.90,   # fin    à 90 % de la hauteur
+                rect.y0 + rect.height * 0.90,   # fin   a 90 % de la hauteur
             )
             img_strip = pdf_page_to_image(page, clip_rect=strip)
             result = search_in_text(ocr_image(img_strip, psm=6))
             if result:
-                doc.close()
-                return result
+                if result[1] == 'priority':
+                    doc.close()
+                    return result
+                if best_fallback is None:
+                    best_fallback = result
         except Exception as e:
-            print(f"  [AVERTISSEMENT] OCR zone ciblée échoué (page {page_num+1}) : {e}")
+            print(f"  [AVERTISSEMENT] OCR zone ciblee echoue (page {page_num+1}) : {e}")
  
     doc.close()
-    return None
+    return best_fallback   # None si rien trouve du tout
  
+ 
+# ──────────────────────────────────────────────
+# RENOMMAGE
+# ──────────────────────────────────────────────
  
 def safe_rename(src: str, dst: str) -> bool:
     """
-    Renomme src → dst.
-    Si dst existe déjà, ajoute un suffixe _1, _2 … pour éviter l'écrasement.
-    Retourne True si succès.
+    Renomme src -> dst.
+    Si dst existe deja, ajoute un suffixe _1, _2 ... pour eviter l'ecrasement.
+    Retourne True si succes.
     """
     base, ext = os.path.splitext(dst)
     counter = 1
@@ -174,7 +242,6 @@ def safe_rename(src: str, dst: str) -> bool:
     while os.path.exists(target):
         target = f"{base}_{counter}{ext}"
         counter += 1
- 
     try:
         os.rename(src, target)
         return True
@@ -184,7 +251,7 @@ def safe_rename(src: str, dst: str) -> bool:
  
  
 def process_directory(directory: str):
-    """Parcourt le dossier et renomme les PDFs trouvés."""
+    """Parcourt le dossier et renomme les PDFs trouves."""
     if not os.path.isdir(directory):
         print(f"[ERREUR] Le dossier n'existe pas : {directory}")
         sys.exit(1)
@@ -192,63 +259,69 @@ def process_directory(directory: str):
     pdf_files = [f for f in os.listdir(directory) if f.lower().endswith(".pdf")]
  
     if not pdf_files:
-        print(f"Aucun fichier PDF trouvé dans : {directory}")
+        print(f"Aucun fichier PDF trouve dans : {directory}")
         return
  
-    print(f"{'=' * 60}")
+    print("=" * 65)
     print(f"  Dossier  : {directory}")
     print(f"  PDFs     : {len(pdf_files)} fichier(s)")
     print(f"  DPI OCR  : {RENDER_DPI}")
-    print(f"  Mode     : {'SIMULATION (DRY RUN)' if DRY_RUN else 'RENOMMAGE RÉEL'}")
-    print(f"{'=' * 60}\n")
+    print(f"  Mode     : {'SIMULATION (DRY RUN)' if DRY_RUN else 'RENOMMAGE REEL'}")
+    print("=" * 65 + "\n")
  
-    renamed  = 0
-    skipped  = 0
+    renamed   = 0
+    skipped   = 0
     not_found = 0
+    fallbacks = 0
  
     for filename in sorted(pdf_files):
         src_path = os.path.join(directory, filename)
-        print(f"[→] {filename}")
+        print(f"[->] {filename}")
  
-        demande_num = extract_demande_number(src_path)
+        extraction = extract_demande_number(src_path)
  
-        if demande_num is None:
-            print(f"  [?] Numéro de demande non trouvé — fichier ignoré.\n")
+        if extraction is None:
+            print("  [?] Aucun numero trouve (Dxxxxxx_xxxxxx ni numero complet) -- ignore.\n")
             not_found += 1
             continue
  
-        new_filename = f"{demande_num}.pdf"
-        dst_path = os.path.join(directory, new_filename)
+        numero, mode = extraction
+        new_filename  = f"{numero}.pdf"
+        dst_path      = os.path.join(directory, new_filename)
+        mode_label    = "[PRIORITE D]    " if mode == 'priority' else "[FALLBACK complet]"
  
-        # Déjà bien nommé ?
+        # Deja bien nomme ?
         if filename == new_filename:
-            print(f"  [✓] Déjà nommé correctement ({new_filename}) — ignoré.\n")
+            print(f"  [OK] Deja nomme correctement ({new_filename}) -- ignore.\n")
             skipped += 1
             continue
  
-        print(f"  [✓] Numéro trouvé : {demande_num}")
-        print(f"  [→] Renommage : {filename}  →  {new_filename}")
+        print(f"  {mode_label} Numero : {numero}")
+        print(f"  [->] {filename}  -->  {new_filename}")
+ 
+        if mode == 'fallback':
+            fallbacks += 1
  
         if DRY_RUN:
-            print(f"  [SIM] (simulation, aucune modification effectuée)\n")
+            print("  [SIM] (simulation, aucune modification effectuee)\n")
             renamed += 1
         else:
             if safe_rename(src_path, dst_path):
-                print(f"  [OK] Renommé avec succès.\n")
+                print("  [OK] Renomme avec succes.\n")
                 renamed += 1
             else:
                 not_found += 1
  
-    # ── Récapitulatif ──
-    print(f"{'=' * 60}")
-    print(f"  Renommés       : {renamed}")
-    print(f"  Déjà corrects  : {skipped}")
-    print(f"  Non traités    : {not_found}")
-    print(f"{'=' * 60}")
+    # ── Recapitulatif ──
+    print("=" * 65)
+    print(f"  Renommes          : {renamed}  (dont {fallbacks} via fallback numero complet)")
+    print(f"  Deja corrects     : {skipped}")
+    print(f"  Non traites       : {not_found}")
+    print("=" * 65)
  
  
 # ──────────────────────────────────────────────
-# POINT D'ENTRÉE
+# POINT D'ENTREE
 # ──────────────────────────────────────────────
  
 if __name__ == "__main__":
