@@ -253,4 +253,4 @@ def process_directory(directory: str):
  
 if __name__ == "__main__":
     configure_tesseract()
-    process_directory(SCAN_DIR)ectory(SCAN_DIR)
+    process_directory(SCAN_DIR)
