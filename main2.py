@@ -49,8 +49,10 @@ DRY_RUN = False
 # ──────────────────────────────────────────────
 # PATTERN du numéro de demande
 # ──────────────────────────────────────────────
-# Correspond à : D123456_789012  (D + 6 chiffres + _ + 6 chiffres)
-DEMANDE_PATTERN = re.compile(r'D\d{6}_\d{6}', re.IGNORECASE)
+# Le champ "N° BON DE COMMANDE" contient par exemple : C90005363/D221114_000139
+# On extrait uniquement la partie  D + 6 chiffres + _ + 6 chiffres
+# Le séparateur avant le D peut être / \ | espace ou début de chaîne.
+DEMANDE_PATTERN = re.compile(r'(?<![A-Z0-9])(D\d{6}_\d{6})(?!\d)', re.IGNORECASE)
  
  
 # ──────────────────────────────────────────────
@@ -67,26 +69,47 @@ def configure_tesseract():
         print("  → Téléchargement : https://github.com/UB-Mannheim/tesseract/wiki\n")
  
  
-def pdf_page_to_image(page, dpi: int = RENDER_DPI) -> Image.Image:
-    """Convertit une page PDF en image PIL via PyMuPDF."""
-    mat = fitz.Matrix(dpi / 72, dpi / 72)   # 72 pt/pouce natif
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img_bytes = pix.tobytes("png")
-    return Image.open(io.BytesIO(img_bytes))
+def pdf_page_to_image(page, dpi: int = RENDER_DPI, clip_rect=None) -> Image.Image:
+    """
+    Convertit une page PDF (ou une zone clip_rect) en image PIL via PyMuPDF.
+    clip_rect : fitz.Rect exprimé en points PDF (avant zoom).
+    """
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    if clip_rect:
+        pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip_rect)
+    else:
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+    return Image.open(io.BytesIO(pix.tobytes("png")))
  
  
-def ocr_image(image: Image.Image) -> str:
-    """Applique l'OCR Tesseract sur une image et retourne le texte."""
-    # PSM 3 = page complète, détection automatique
-    config = "--psm 3"
+def ocr_image(image: Image.Image, psm: int = 3) -> str:
+    """
+    Applique l'OCR Tesseract sur une image PIL et retourne le texte.
+    psm=3  → page complète (défaut)
+    psm=6  → bloc de texte uniforme (bon pour une zone isolée)
+    """
+    config = f"--psm {psm} --oem 3"
     return pytesseract.image_to_string(image, lang=OCR_LANG, config=config)
+ 
+ 
+def search_in_text(text: str) -> str | None:
+    """Cherche le pattern dans un texte et retourne la valeur normalisée."""
+    match = DEMANDE_PATTERN.search(text)
+    return match.group(1).upper() if match else None
  
  
 def extract_demande_number(pdf_path: str) -> str | None:
     """
-    Ouvre le PDF, parcourt les premières pages avec OCR et retourne
-    le premier numéro de demande trouvé (format Dxxxxxx_xxxxxx).
-    Retourne None si aucun numéro n'est trouvé.
+    Ouvre le PDF, parcourt les premières pages et retourne le premier
+    numéro de demande trouvé (format Dxxxxxx_xxxxxx).
+ 
+    Stratégie par page :
+      1. Texte natif (si le PDF n'est pas un scan pur).
+      2. OCR page entière à RENDER_DPI.
+      3. OCR ciblé sur la moitié inférieure de la page
+         (zone où se trouve le tableau "N° BON DE COMMANDE").
+ 
+    Retourne None si aucun numéro n'est trouvé sur toutes les pages.
     """
     try:
         doc = fitz.open(pdf_path)
@@ -99,23 +122,41 @@ def extract_demande_number(pdf_path: str) -> str | None:
     for page_num in range(pages_to_check):
         page = doc[page_num]
  
-        # 1) Essai extraction texte natif (rapide)
+        # ── 1) Texte natif ────────────────────────────────────────────────
         native_text = page.get_text()
-        match = DEMANDE_PATTERN.search(native_text)
-        if match:
+        result = search_in_text(native_text)
+        if result:
             doc.close()
-            return match.group(0).upper()
+            return result
  
-        # 2) Fallback OCR sur l'image de la page (PDF scanné)
+        # ── 2) OCR page entière ───────────────────────────────────────────
         try:
-            image = pdf_page_to_image(page)
-            ocr_text = ocr_image(image)
-            match = DEMANDE_PATTERN.search(ocr_text)
-            if match:
+            img_full = pdf_page_to_image(page)
+            result = search_in_text(ocr_image(img_full, psm=3))
+            if result:
                 doc.close()
-                return match.group(0).upper()
+                return result
         except Exception as e:
-            print(f"  [AVERTISSEMENT] OCR échoué page {page_num + 1} de {pdf_path} : {e}")
+            print(f"  [AVERTISSEMENT] OCR page entière échoué (page {page_num+1}) : {e}")
+ 
+        # ── 3) OCR ciblé — moitié basse de la page ────────────────────────
+        # Le champ "N° BON DE COMMANDE" est typiquement dans la bande
+        # comprise entre 55 % et 85 % de la hauteur de la page.
+        try:
+            rect = page.rect                                # dimensions en pt
+            strip = fitz.Rect(
+                rect.x0,
+                rect.y0 + rect.height * 0.50,   # début à 50 % de la hauteur
+                rect.x1,
+                rect.y0 + rect.height * 0.90,   # fin    à 90 % de la hauteur
+            )
+            img_strip = pdf_page_to_image(page, clip_rect=strip)
+            result = search_in_text(ocr_image(img_strip, psm=6))
+            if result:
+                doc.close()
+                return result
+        except Exception as e:
+            print(f"  [AVERTISSEMENT] OCR zone ciblée échoué (page {page_num+1}) : {e}")
  
     doc.close()
     return None
@@ -212,4 +253,4 @@ def process_directory(directory: str):
  
 if __name__ == "__main__":
     configure_tesseract()
-    process_directory(SCAN_DIR)
+    process_directory(SCAN_DIR)ectory(SCAN_DIR)
