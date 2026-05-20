@@ -27,7 +27,7 @@ import io
 DOSSIER = r"C:\Users\fto\Downloads\Scans\2022"
 
 # Chemin vers tesseract.exe (modifier si nécessaire)
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = r"C:\Users\fto\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 
 # Résolution de rendu (DPI) — augmenter si les documents sont peu lisibles
 DPI = 300
